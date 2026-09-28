@@ -108,12 +108,28 @@ class TestFixedWidth(unittest.TestCase):
         self.assertEqual(r.read_bits(64), 0)
 
     def test_known_bit_layout(self):
-        # MSB-first within byte: 0b1 (1 bit) then 0b101 (3 bits) -> 0b1011_0000
+        # MSB-first within byte: 0b1 (1 bit) then 0b101 (3 bits) -> 0b1101_0000
         w = BitWriter()
         w.write_bits(0b1, 1).write_bits(0b101, 3)
         # stream bits: 1,1,0,1 -> byte 0b1101_0000
         self.assertEqual(w.tobytes(), b"\xd0")
         self.assertEqual(w.bit_length, 4)
+
+    def test_bit_layout_byte_sequence_across_bytes(self):
+        # Fields crossing the byte boundary, MSB-first. Bit stream:
+        #   10101 | 1000101 | 0  (5 bits, 7 bits, 1 bit = 13 bits)
+        # padded to 0b10101100_01010000 -> bytes ac 50
+        w = BitWriter()
+        w.write_bits(0b10101, 5)
+        w.write_bits(0b1000101, 7)
+        w.write_bits(0b0, 1)
+        self.assertEqual(w.tobytes(), b"\xac\x50")
+        self.assertEqual(w.bit_length, 13)
+        # same bit pattern must read back field by field
+        r = BitReader(w.tobytes(), 0, 13)
+        self.assertEqual(r.read_bits(5), 0b10101)
+        self.assertEqual(r.read_bits(7), 0b1000101)
+        self.assertEqual(r.read_bits(1), 0b0)
 
 
 class TestVarint(unittest.TestCase):
@@ -254,22 +270,6 @@ class TestDifferential(unittest.TestCase):
 
 class TestStreaming(unittest.TestCase):
     """Chunked/bit-cut decoding must equal one-shot decoding exactly."""
-
-    def _decode_with_retries(self, reader, ops):
-        out = []
-        for op in ops:
-            while True:
-                try:
-                    if op[0] == "bits":
-                        out.append(reader.read_bits(op[2]))
-                    elif op[0] == "uvarint":
-                        out.append(reader.read_uvarint())
-                    else:
-                        out.append(reader.read_svarint())
-                    break
-                except NeedMoreBits:
-                    return out, False  # caller feeds more, then resumes
-        return out, True
 
     def test_bit_cut_fragmentation(self):
         rng = random.Random(99)
