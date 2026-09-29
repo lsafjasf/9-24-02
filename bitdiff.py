@@ -5,7 +5,9 @@
 2. 比较库与参考实现解码出的每一个值;
 3. 把编码结果切成随机大小的位块喂入流式解码器,
    验证跨块读取与一次性读取完全一致;
-4. 给出变长编码与定长 64 位编码的体积对比。
+4. 在随机断点快照续读游标, 序列化后换一个读取器按任意位块喂到
+   游标处恢复, 继续解码, 验证与一次性读取完全一致;
+5. 给出变长编码与定长 64 位编码的体积对比。
 
 用法: python3 bitdiff.py [iterations] [seed]
 """
@@ -102,6 +104,60 @@ def run_round(rng, iterations):
         for op in ops:
             assert read_op(stream, op) == op[1], "chunked decode mismatch"
 
+        # 4. 游标续读对拍: 随机断点快照游标并序列化, 换读取器按任意
+        #    位块喂到游标处恢复, 边喂边读, 结果必须与一次性读取一致
+        split = rng.randrange(len(ops) + 1)
+        r1 = vb.BitReader()
+        feed_in_random_bit_chunks(r1, lib_bits, rng)
+        for op in ops[:split]:
+            read_op(r1, op)
+        state = r1.cursor().to_dict()
+        assert state["position"] == r1.position
+        assert state["block_index"] * 8 + state["bit_offset"] == r1.position
+
+        r2 = vb.BitReader()
+        feed_in_random_bit_chunks(r2, lib_bits[:state["position"]], rng)
+        r2.restore(vb.BitCursor.from_dict(state))
+        assert r2.position == r1.position
+        fed = state["position"]
+        for op in ops[split:]:
+            while True:
+                try:
+                    got = read_op(r2, op)
+                    break
+                except vb.InsufficientBits:
+                    take = min(rng.randrange(1, 18), len(lib_bits) - fed)
+                    assert take > 0
+                    chunk = 0
+                    for bit in lib_bits[fed:fed + take]:
+                        chunk = (chunk << 1) | bit
+                    r2.feed_bits(chunk, take)
+                    fed += take
+            assert got == op[1], "cursor resume mismatch %r != %r" % (got, op[1])
+
+
+def layout_demo():
+    print("\n== 位布局导出示例(自定义格式核对) ==")
+    w = vb.BitWriter()
+    w.write_bits(0b101, 3)        # 自定义头
+    w.write_uvarint(300)          # 无符号变长整数
+    w.write_svarint(-7)           # 有符号(ZigZag)
+    w.write_bits(0x2FF, 10)       # 定宽原始位段
+    print(w.layout([("header", 3), ("uvarint", 16),
+                    ("svarint", 8), ("raw", 10)]))
+    # 非最短编码的位级定位
+    bad = vb.BitWriter()
+    bad.write_bits(0b10101, 5)
+    bad.write_bits(0x85, 8).write_bits(0x80, 8).write_bits(0x00, 8)
+    r = vb.BitReader(bad.to_bytes())
+    r.read_bits(5)
+    try:
+        r.read_uvarint()
+    except vb.NonShortestEncodingError as e:
+        print("\n非最短编码定位: %s" % e)
+        print("  多余 %d 字节, 位区间 [%d, %d)" % (
+            e.extra_bytes, e.start_bit, e.end_bit))
+
 
 def size_report(rng):
     print("\n== 变长编码 vs 定长 64 位编码 ==")
@@ -149,6 +205,7 @@ def main():
     rng = random.Random(seed)
     run_round(rng, iterations)
     print("OK: %d 轮随机对拍通过(每一位、每个值、任意位块边界均一致)" % iterations)
+    layout_demo()
     size_report(rng)
 
 

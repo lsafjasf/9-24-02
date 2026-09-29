@@ -212,5 +212,238 @@ class StreamingTest(unittest.TestCase):
             self.assertEqual(got, oneshot)
 
 
+def _random_ops(rng, count):
+    ops = []
+    for _ in range(count):
+        kind = rng.choice("uusb")
+        if kind == "u":
+            tier = rng.randrange(65)
+            ops.append(("u", rng.getrandbits(tier) if tier else 0))
+        elif kind == "s":
+            tier = rng.randrange(64)
+            n = rng.getrandbits(tier) if tier else 0
+            ops.append(("s", -n - 1 if rng.random() < 0.5 else n))
+        else:
+            width = rng.randrange(1, 65)
+            ops.append(("b", rng.getrandbits(width), width))
+    return ops
+
+
+def _write_ops(ops):
+    w = vb.BitWriter()
+    for op in ops:
+        if op[0] == "u":
+            w.write_uvarint(op[1])
+        elif op[0] == "s":
+            w.write_svarint(op[1])
+        else:
+            w.write_bits(op[1], op[2])
+    return w.to_bytes(), w.bit_length
+
+
+def _read_op(reader, op):
+    if op[0] == "u":
+        return reader.read_uvarint()
+    if op[0] == "s":
+        return reader.read_svarint()
+    return reader.read_bits(op[2])
+
+
+def _bits_of(data, nbits):
+    return [(data[i >> 3] >> (7 - (i & 7))) & 1 for i in range(nbits)]
+
+
+def _feed_bits_chunked(reader, bits, rng, max_chunk=17):
+    pos = 0
+    while pos < len(bits):
+        take = min(rng.randrange(1, max_chunk), len(bits) - pos)
+        chunk = 0
+        for bit in bits[pos:pos + take]:
+            chunk = (chunk << 1) | bit
+        reader.feed_bits(chunk, take)
+        pos += take
+
+
+class CursorTest(unittest.TestCase):
+    def test_cursor_tracks_block_and_bit(self):
+        r = vb.BitReader(b"\xde\xad\xbe\xef")
+        r.read_bits(3)
+        cur = r.cursor()
+        self.assertEqual((cur.position, cur.block_index, cur.bit_offset),
+                         (3, 0, 3))
+        r.read_bits(9)
+        cur = r.cursor()
+        self.assertEqual((cur.position, cur.block_index, cur.bit_offset),
+                         (12, 1, 4))
+
+    def test_cursor_serialization(self):
+        cur = vb.BitCursor(12345)
+        state = cur.to_dict()
+        self.assertEqual(state, {"position": 12345,
+                                 "block_index": 12345 >> 3,
+                                 "bit_offset": 12345 & 7})
+        self.assertEqual(vb.BitCursor.from_dict(state), cur)
+        with self.assertRaises(ValueError):
+            vb.BitCursor(-1)
+
+    def test_restore_rejects_unfed_position(self):
+        r = vb.BitReader(b"\x00")
+        with self.assertRaises(ValueError):
+            r.restore(vb.BitCursor(9))
+        r.feed(b"\x00")
+        r.restore(vb.BitCursor(9))  # 现在已喂够, 合法
+        self.assertEqual(r.position, 9)
+
+    def test_resume_matches_oneshot(self):
+        # 对拍: 任意断点快照游标 -> 序列化 -> 换读取器按随机位块喂到
+        # 游标处恢复 -> 交错喂剩余位继续读, 结果必须与一次性读取一致。
+        rng = random.Random(20260929)
+        for _ in range(300):
+            ops = _random_ops(rng, rng.randrange(1, 25))
+            data, nbits = _write_ops(ops)
+            bits = _bits_of(data, nbits)
+            base_reader = vb.BitReader(data)
+            oneshot = [_read_op(base_reader, op) for op in ops]
+
+            split = rng.randrange(len(ops) + 1)
+            r1 = vb.BitReader()
+            _feed_bits_chunked(r1, bits, rng)
+            got = [_read_op(r1, op) for op in ops[:split]]
+            state = r1.cursor().to_dict()
+
+            r2 = vb.BitReader()
+            _feed_bits_chunked(r2, bits[:state["position"]], rng)
+            r2.restore(vb.BitCursor.from_dict(state))
+            self.assertEqual(r2.position, state["position"])
+            fed = state["position"]
+            for op in ops[split:]:
+                while True:
+                    try:
+                        got.append(_read_op(r2, op))
+                        break
+                    except vb.InsufficientBits:
+                        take = min(rng.randrange(1, 11), nbits - fed)
+                        self.assertGreater(take, 0)
+                        chunk = 0
+                        for bit in bits[fed:fed + take]:
+                            chunk = (chunk << 1) | bit
+                        r2.feed_bits(chunk, take)
+                        fed += take
+            self.assertEqual(got, oneshot)
+
+
+class NonShortestDetailTest(unittest.TestCase):
+    def test_reports_extra_bytes_and_start_bit(self):
+        # 前缀 5 位, 然后 0x85 0x80 0x00: 值 5 用 3 字节编码(最短为 1
+        # 字节), 多余的 2 个零载荷字节在编码尾部, 从第 5+8=13 位开始
+        w = vb.BitWriter()
+        w.write_bits(0b10101, 5)
+        w.write_bits(0x85, 8)
+        w.write_bits(0x80, 8)
+        w.write_bits(0x00, 8)
+        data, nbits = w.to_bytes(), w.bit_length
+        r = vb.BitReader(data)
+        r.read_bits(5)
+        with self.assertRaises(vb.NonShortestEncodingError) as ctx:
+            r.read_uvarint()
+        err = ctx.exception
+        self.assertEqual(err.extra_bytes, 2)
+        self.assertEqual(err.start_bit, 13)
+        self.assertEqual(err.end_bit, 29)
+        # 逐位核对: [start_bit, end_bit) 正是尾部的 0x80 与 0x00
+        bits = _bits_of(data, nbits)
+        self.assertEqual(bits[13:21], [1, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(bits[21:29], [0, 0, 0, 0, 0, 0, 0, 0])
+        self.assertIn("2", str(err))
+        self.assertIn("13", str(err))
+
+    def test_extra_region_removal_yields_shortest(self):
+        # 随机前缀位 + 随机多余字节数: 删掉报告的多余位区间后,
+        # 剩下的编码必须是最短编码且解码出同一个值。
+        rng = random.Random(99)
+        for _ in range(200):
+            prefix = rng.randrange(8)
+            extra = rng.randrange(1, 4)
+            tier = rng.randrange(1, 50)
+            value = rng.getrandbits(tier)
+            shortest_len = max(1, (value.bit_length() + 6) // 7)
+            w = vb.BitWriter()
+            if prefix:
+                w.write_bits(rng.getrandbits(prefix), prefix)
+            # 最短编码的每个字节都置续位, 再追加 extra 个零载荷组
+            enc = []
+            v = value
+            for _ in range(shortest_len):
+                enc.append((v & 0x7F) | 0x80)
+                v >>= 7
+            for _ in range(extra):
+                enc.append(0x80)
+            enc[-1] &= 0x7F  # 最后一字节清续位(0x80 -> 0x00)
+            for byte in enc:
+                w.write_bits(byte, 8)
+            data, nbits = w.to_bytes(), w.bit_length
+            r = vb.BitReader(data)
+            if prefix:
+                r.read_bits(prefix)
+            with self.assertRaises(vb.NonShortestEncodingError) as ctx:
+                r.read_uvarint()
+            err = ctx.exception
+            self.assertEqual(err.extra_bytes, extra)
+            self.assertEqual(err.start_bit, prefix + 8 * shortest_len)
+            self.assertEqual(err.end_bit, prefix + 8 * (shortest_len + extra))
+            # 逐位核对: 多余区域内除最后一字节为 0x00 外全是 0x80
+            bits = _bits_of(data, nbits)
+            for i in range(err.start_bit, err.end_bit):
+                first_of_byte = (i - err.start_bit) % 8 == 0
+                last_byte = i < err.end_bit - 8
+                self.assertEqual(bits[i], 1 if (first_of_byte and last_byte)
+                                 else 0, "bit %d" % i)
+            # 删除多余位区间, 并把新的末字节续位清 0 -> 最短编码,
+            # 解码必须得到同一个值且不再报错
+            trimmed = bits[:err.start_bit] + bits[err.end_bit:]
+            trimmed[err.start_bit - 8] = 0
+            tw = vb.BitWriter()
+            for bit in trimmed:
+                tw.write_bits(bit, 1)
+            tr = vb.BitReader(tw.to_bytes())
+            if prefix:
+                tr.read_bits(prefix)
+            self.assertEqual(tr.read_uvarint(), value)
+
+
+class LayoutExportTest(unittest.TestCase):
+    def test_layout_bitstream_and_fields(self):
+        w = vb.BitWriter()
+        w.write_bits(0b101, 3)
+        w.write_uvarint(300)          # 0xAC 0x02
+        w.write_bits(0x2FF, 10)
+        data, nbits = w.to_bytes(), w.bit_length
+        text = w.layout([("hdr", 3), ("var", 16), ("raw", 10)])
+        # 位流逐位核对: 文本中的位流行与有效位标记必须与实际比特一致
+        all_bits = _bits_of(data, len(data) * 8)
+        grouped = " ".join("".join(str(b) for b in all_bits[i:i + 8])
+                           for i in range(0, len(all_bits), 8))
+        self.assertIn(grouped, text)
+        self.assertIn("hdr", text)
+        self.assertIn("101", text)
+        self.assertIn("value=5", text)
+        self.assertIn("value=%d" % 0x2FF, text)
+        # 有效位标记: ^ 的数量必须等于有效位数
+        caret_line = [ln for ln in text.splitlines() if "^" in ln][0]
+        self.assertEqual(caret_line.split("  (")[0].count("^"), nbits)
+        # 未覆盖字段记为 <rest>
+        text2 = vb.format_layout(data, nbits, [("hdr", 3)])
+        self.assertIn("<rest>", text2)
+
+    def test_layout_validates_arguments(self):
+        data = b"\xAC\x02"
+        with self.assertRaises(ValueError):
+            vb.format_layout(data, 17)
+        with self.assertRaises(ValueError):
+            vb.format_layout(data, 16, [("too_long", 24)])
+        with self.assertRaises(ValueError):
+            vb.format_layout(data, 16, [("zero", 0)])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,15 +33,76 @@ class InsufficientBits(Exception):
 
 
 class NonShortestEncodingError(Exception):
-    """非最短变长编码。extra_bytes 为多余的字节数。"""
+    """非最短变长编码。
 
-    def __init__(self, extra_bytes):
+    extra_bytes: 多余的字节数; start_bit / end_bit: 多余字节区域的位
+    偏移区间 [start_bit, end_bit)(从 0 计)。LEB128 的冗余是最高有效
+    端的零载荷组, 即编码尾部的若干字节: 除最后一字节为 0x00 外,
+    其余均为 0x80, 可据此逐位核对。
+    """
+
+    def __init__(self, extra_bytes, start_bit=None, end_bit=None):
         self.extra_bytes = extra_bytes
-        super().__init__("non-shortest varint: %d extra byte(s)" % extra_bytes)
+        self.start_bit = start_bit
+        self._end_bit = end_bit
+        if start_bit is None:
+            super().__init__("non-shortest varint: %d extra byte(s)" % extra_bytes)
+        else:
+            super().__init__(
+                "non-shortest varint: %d extra byte(s) from bit %d to bit %d"
+                % (extra_bytes, start_bit, self.end_bit))
+
+    @property
+    def end_bit(self):
+        if self._end_bit is not None:
+            return self._end_bit
+        if self.start_bit is None:
+            return None
+        return self.start_bit + 8 * self.extra_bytes
 
 
 class VarintOverflowError(Exception):
     """变长整数超过 64 位。"""
+
+
+class BitCursor:
+    """续读游标: 记录已消费的位数与所在块, 支持跨块任意位边界恢复读取。
+
+    position: 已消费的总位数; block_index: 所在字节块下标;
+    bit_offset: 块内位偏移(0..7)。to_dict/from_dict 可持久化,
+    之后用 BitReader.restore 从游标处继续读。
+    """
+
+    __slots__ = ("position",)
+
+    def __init__(self, position=0):
+        if position < 0:
+            raise ValueError("cursor position must be >= 0")
+        self.position = position
+
+    @property
+    def block_index(self):
+        return self.position >> 3
+
+    @property
+    def bit_offset(self):
+        return self.position & 7
+
+    def to_dict(self):
+        return {"position": self.position,
+                "block_index": self.block_index,
+                "bit_offset": self.bit_offset}
+
+    @classmethod
+    def from_dict(cls, state):
+        return cls(int(state["position"]))
+
+    def __eq__(self, other):
+        return isinstance(other, BitCursor) and self.position == other.position
+
+    def __repr__(self):
+        return "BitCursor(position=%d, block=%d, bit_offset=%d)" % (
+            self.position, self.block_index, self.bit_offset)
 
 
 class BitWriter:
@@ -82,6 +143,10 @@ class BitWriter:
             return bytes(self._out)
         return bytes(self._out) + bytes([(self._acc << (8 - self._nbits)) & 0xFF])
 
+    def layout(self, fields=None):
+        """导出当前已写入内容的位布局文本(见 format_layout)。"""
+        return format_layout(self.to_bytes(), self.bit_length, fields)
+
 
 class BitReader:
     """流式位流读取器: 可按字节或按位喂入, 不依赖整体长度。"""
@@ -119,6 +184,19 @@ class BitReader:
         return self._pos
 
     def reset(self, position):
+        self._pos = position
+
+    def cursor(self):
+        """快照当前读取位置为续读游标(见 BitCursor)。"""
+        return BitCursor(self._pos)
+
+    def restore(self, cursor):
+        """从游标恢复读取位置。游标位置不能超过已喂入的位数。"""
+        position = cursor.position if isinstance(cursor, BitCursor) else int(cursor)
+        if not 0 <= position <= self._end:
+            raise ValueError(
+                "cursor position %d outside fed data (%d bit(s))"
+                % (position, self._end))
         self._pos = position
 
     @property
@@ -196,7 +274,10 @@ def read_uvarint(reader):
         if not byte & 0x80:
             if payload == 0 and i > 0:
                 reader.reset(mark)
-                raise NonShortestEncodingError((i + 1) - _shortest_size(value))
+                shortest = _shortest_size(value)
+                raise NonShortestEncodingError(
+                    (i + 1) - shortest,
+                    mark + 8 * shortest, mark + 8 * (i + 1))
             return value
 
 
@@ -219,3 +300,66 @@ def write_svarint(writer, n):
 
 def read_svarint(reader):
     return zigzag_decode(read_uvarint(reader))
+
+
+def format_layout(data, nbits=None, fields=None):
+    """导出位布局文本, 便于逐位核对自定义格式。
+
+    data: 编码后的字节串; nbits: 有效位数(默认全部, 末尾视为补 0 的
+    位会以空白标出); fields: 可选的 [(名称, 位宽), ...], 按顺序从第
+    0 位切分并显示每段的比特与整数值, 未覆盖部分记为 <rest>。
+    """
+    total = len(data) * 8
+    if nbits is None:
+        nbits = total
+    if not 0 <= nbits <= total:
+        raise ValueError("nbits %d out of range [0, %d]" % (nbits, total))
+    bits = [(data[i >> 3] >> (7 - (i & 7))) & 1 for i in range(total)]
+    pad = total - nbits
+
+    stream = []
+    ruler = []
+    for i, bit in enumerate(bits):
+        if i and i % 8 == 0:
+            stream.append(" ")
+            ruler.append(" ")
+        stream.append(str(bit))
+        ruler.append("^" if i < nbits else " ")
+
+    lines = ["== 位布局: 有效 %d 位 / 共 %d 位 (%d 字节, 补 0 %d 位) =="
+             % (nbits, total, len(data), pad),
+             "位流 (MSB first):",
+             "  " + "".join(stream),
+             "  " + "".join(ruler) + ("  (^=有效位)" if pad else "")]
+
+    lines.append("字节视图:")
+    for byte_index in range(len(data)):
+        base = byte_index * 8
+        pad_here = max(0, min(8, base + 8 - nbits))
+        note = "  (低 %d 位补 0)" % pad_here if pad_here else ""
+        lines.append("  byte %-3d bit %3d..%-3d 0x%02X  %s%s" % (
+            byte_index, base, base + 7, data[byte_index],
+            "".join(str(bits[base + k]) for k in range(8)), note))
+
+    if fields:
+        covered = sum(width for _, width in fields)
+        if covered > nbits:
+            raise ValueError(
+                "fields cover %d bit(s) > nbits %d" % (covered, nbits))
+        lines.append("字段视图:")
+        pos = 0
+        for name, width in fields:
+            if width < 1:
+                raise ValueError("field %r width must be >= 1" % name)
+            value = 0
+            for i in range(pos, pos + width):
+                value = (value << 1) | bits[i]
+            bitstr = "".join(str(bits[i]) for i in range(pos, pos + width))
+            lines.append("  bit %3d..%-3d %-12s %s  value=%d"
+                         % (pos, pos + width - 1, name, bitstr, value))
+            pos += width
+        if pos < nbits:
+            bitstr = "".join(str(bits[i]) for i in range(pos, nbits))
+            lines.append("  bit %3d..%-3d %-12s %s"
+                         % (pos, nbits - 1, "<rest>", bitstr))
+    return "\n".join(lines)
