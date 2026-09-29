@@ -259,21 +259,3 @@ class BitReader:
         magnitude up to 2**(max_bits-1)-1 / -2**(max_bits-1) fits.
         """
         return zigzag_decode(self.read_uvarint(max_bits))
-
-    # ---- convenience -------------------------------------------------
-
-    def read_all(self, readers):
-        """Apply ``readers`` (callables) in order; returns list of results.
-
-        Raises NeedMoreBits if the remaining input is insufficient; the
-        cursor is left at the start so the whole batch can be retried.
-        """
-        saved = self._pos
-        out = []
-        try:
-            for r in readers:
-                out.append(r())
-        except NeedMoreBits:
-            self._pos = saved
-            raise
-        return out

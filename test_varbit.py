@@ -108,12 +108,26 @@ class TestFixedWidth(unittest.TestCase):
         self.assertEqual(r.read_bits(64), 0)
 
     def test_known_bit_layout(self):
-        # MSB-first within byte: 0b1 (1 bit) then 0b101 (3 bits) -> 0b1011_0000
+        # MSB-first within byte: 0b1 (1 bit) then 0b101 (3 bits) -> 0b1101_0000
         w = BitWriter()
         w.write_bits(0b1, 1).write_bits(0b101, 3)
         # stream bits: 1,1,0,1 -> byte 0b1101_0000
         self.assertEqual(w.tobytes(), b"\xd0")
         self.assertEqual(w.bit_length, 4)
+
+    def test_known_bit_layout_bytes(self):
+        # byte-sequence ground truth across a byte boundary:
+        # 0b1 (1 bit), 0b101 (3 bits), 0xF0 (8 bits)
+        # stream bits: 1 101 11110000 -> 0b1101_1111 0b0000_0000
+        w = BitWriter()
+        w.write_bits(0b1, 1).write_bits(0b101, 3).write_bits(0xF0, 8)
+        self.assertEqual(w.tobytes(), b"\xdf\x00")
+        self.assertEqual(w.bit_length, 12)
+        r = BitReader(w.tobytes(), 0, w.bit_length)
+        self.assertEqual(r.read_bits(1), 0b1)
+        self.assertEqual(r.read_bits(3), 0b101)
+        self.assertEqual(r.read_bits(8), 0xF0)
+        self.assertEqual(r.bits_remaining, 0)
 
 
 class TestVarint(unittest.TestCase):
@@ -254,22 +268,6 @@ class TestDifferential(unittest.TestCase):
 
 class TestStreaming(unittest.TestCase):
     """Chunked/bit-cut decoding must equal one-shot decoding exactly."""
-
-    def _decode_with_retries(self, reader, ops):
-        out = []
-        for op in ops:
-            while True:
-                try:
-                    if op[0] == "bits":
-                        out.append(reader.read_bits(op[2]))
-                    elif op[0] == "uvarint":
-                        out.append(reader.read_uvarint())
-                    else:
-                        out.append(reader.read_svarint())
-                    break
-                except NeedMoreBits:
-                    return out, False  # caller feeds more, then resumes
-        return out, True
 
     def test_bit_cut_fragmentation(self):
         rng = random.Random(99)
